@@ -1,0 +1,165 @@
+---
+title: "Spatial patterns in marine mammal phylogenetic diversity"
+author: "Max Czapanskiy"
+date: "10/2/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(ape)
+library(fasterize)
+library(ggtree)
+library(here)
+library(picante)
+library(rnaturalearth)
+library(raster)
+library(sf)
+library(tidyverse)
+```
+
+## Range maps
+
+Range maps can be represented by vectors (i.e. shapefiles) or rasters. Here we load the vectors and rasterize them to 110km cells for investigating overlapping ranges.
+
+```{r ranges}
+# Common projection, Behrmann equal area
+cea_proj4 <- "+proj=cea +lon_0=0 +lat_ts=30 +x_0=0 +y_0=0 +datum=WGS84 +ellps=WGS84 +units=km +no_defs"
+marmam_shp <- st_read(here("data/ranges/marmam.shp")) %>% 
+  st_transform(cea_proj4)
+# Create a global, 110km resolution raster template
+template <- raster(
+  crs = CRS("+proj=longlat +datum=WGS84"),
+  xmn = -180, xmx = 180,
+  ymn = -90, ymx = 90
+) %>% 
+  projectRaster(crs = cea_proj4)
+res(template) <- 110
+# Rasterize the marine mammal ranges. Resulting brick has a layer for each species.
+marmam_rb <- fasterize(
+  marmam_shp,
+  template,
+  fun = "any",
+  by = "BINOMIAL"
+) 
+# The binomial names in marmam_rb are "." separated e.g. Stenella.attenuata, but
+# in the phylogenetic tree we will use they are "_" separated. Fix to match.
+names(marmam_rb) <- str_replace(names(marmam_rb), "\\.", "_")
+```
+
+As examples, here are the vector and raster representations of the range of the harbor porpoise (*Phocoena phocoena*).
+
+```{r phph}
+# Vector representation
+coastline <- ne_coastline("small", "sf") %>% 
+  st_transform(cea_proj4)
+phph_shp <- filter(marmam_shp, BINOMIAL == "Phocoena phocoena") 
+ggplot(phph_shp) + 
+  geom_sf(data = coastline, color = "black") +
+  geom_sf(color = NA, fill = "blue") +
+  coord_sf(ylim = c(0, 90), crs = "+proj=longlat +datum=WGS84") +
+  theme_void()
+# Raster representation
+phph_idx <- which(names(marmam_rb) == "Phocoena_phocoena")
+plot(marmam_rb[[phph_idx]], col = "blue", legend = FALSE)
+for (i in seq(nrow(coastline))) {
+  coastline_mtx <- as.matrix(coastline$geometry[[i]])
+  lines(coastline_mtx[, 1], coastline_mtx[, 2])
+}
+```
+
+## Alpha diversity
+
+The simplest metric of biodiversity is "alpha diversity", a count of species richness. We can calculate marine mammal alpha diversity in each 110km^2 cell by counting the non-missing layers. Alpha diversity is highest in the subtropics, especially places like the southeast coast of South America, around South Africa, and between Australia and New Zealand. 
+
+```{r alpha}
+marmam_alpha <- sum(marmam_rb, na.rm = TRUE) %>% 
+  as.data.frame(xy = TRUE) %>% 
+  rename(alpha_rich = layer)
+ggplot() +
+  geom_raster(aes(x, y, fill = alpha_rich), marmam_alpha) +
+  geom_sf(data = coastline) +
+  scale_fill_gradientn("Alpha richness", 
+                       colors = c("dark blue", "light blue", "pink", "red")) +
+  theme_void() +
+  theme(legend.direction = "horizontal",
+        legend.position = "bottom")
+```
+
+## Phylogenetic diversity
+
+A more sophisticated metric for biodiversity is Faith's phylogenetic diversity (*PD*), which accounts for the evolutionary history of a community. Say you have two communities with three species each. One has three types of dolphin and the other has a dolphin, a manatee, and a seal. Alpha richness is equal in the two communities but *PD* is higher in the community with species from more distant lineages.
+
+### Phylogenetic tree
+
+To calculate *PD* we'll need a dated phylogenetic tree. We'll use the mammal tree from Faurby & Svenning (2015). This shows the relationships between sirenians (dugongs and manatees), carnivores (seals, sea lions, walruses, and marine otters), and cetaceans (porpoises, dolphins, and whales).
+
+```{r phylo, fig.height=10, fig.width = 10}
+# Read tree and drop species if we don't have a shape for it
+marmam_tr <- read.tree(here("data", "trees", "mammals.nex")) %>% 
+  drop.tip(.$tip.label[!.$tip.label %in% names(marmam_rb)])
+marmam_mrca <- mrca(marmam_tr)
+sirenia_root <- marmam_mrca["Trichechus_manatus", "Dugong_dugon"]
+carnivora_root <- marmam_mrca["Lontra_felina", "Phoca_vitulina"]
+cetacea_root <- marmam_mrca["Delphinus_capensis", "Eubalaena_australis"]
+marmam_tr2 <- groupClade(
+  marmam_tr, 
+  c(Sirenia = sirenia_root, 
+    Carnivora = carnivora_root,
+    Cetacea = cetacea_root)
+)
+ggtree(marmam_tr2, 
+               aes(color = group), 
+               layout = "circular",
+               branch.length = marmam_tr2$edge.length) +
+  geom_tiplab(show.legend = FALSE) +
+  scale_color_discrete(breaks = c("Cetacea", "Carnivora", "Sirenia")) +
+  guides(color = guide_legend(override.aes = list(size = 2))) +
+  theme(legend.position = c(0.5, 0.45),
+        legend.justification = c(0.5, 1),
+        legend.key.width = unit(10, "mm"),
+        legend.key.height = unit(10, "mm"),
+        legend.text = element_text(size = 22),
+        legend.title = element_blank())
+```
+
+### Faith's PD map
+
+When we incorporate the phylogenetic tree into biodiversity measures, we get a very different map. The regions with the highest phylogenetic diversity are all temperate and sub-polar. Alpha richness is driven by the remarkable radiation of dolphins, the most speciose marine mammal clade, which are found in lower latitudes. Pinnipeds are virtually absent from the tropics, so the high phylogenetic diversity at higher latitudes reflects the overlap of distantly related major clades (cetaceans and pinnipeds).
+
+```{r pd}
+## Calculate Faith's phylogenetic diversity
+# pd() takes a "community data matrix" as input, which has species in columns 
+# and locations in rows. Convert a rasterbrick to a community data matrix.
+marmam_mtx <- matrix(0, nrow = ncell(marmam_rb), ncol = nlayers(marmam_rb))
+colnames(marmam_mtx) <- names(marmam_rb)
+rownames(marmam_mtx) <- seq(ncell(marmam_rb))
+for (i in seq(nlayers(marmam_rb))) {
+  marmam_mtx[, i] = as.vector(marmam_rb[[i]])
+}
+# Disregard the "no non-missing arguments..." messages. Seems to be an issue in
+# the fasterize package
+
+# Remove empty row (i.e. locations without marine mammals)
+empty_rows <- apply(marmam_mtx, 1, function(row) all(is.na(row)))
+marmam_mtx <- marmam_mtx[!empty_rows, ]
+# Calculate Faith's PD
+marmam_pd <- pd(marmam_mtx, marmam_tr)
+# pd() returns a data.frame and the rownames correspond to the index in raster,
+# so make a column for the raster index (i) and get the XY location from the 
+# original raster
+marmam_pd_tbl <- as_tibble(marmam_pd, rownames = "i") %>% 
+  mutate(i = as.numeric(i))
+lonlat = xyFromCell(marmam_rb, marmam_pd_tbl$i)
+marmam_pd_tbl$lon = lonlat[, 1]
+marmam_pd_tbl$lat = lonlat[, 2]
+## Plot phylo div
+ggplot() +
+  geom_raster(aes(lon, lat, fill = PD), marmam_pd_tbl) +
+  geom_sf(data = coastline) +
+  scale_fill_gradientn("Phylogenetic diversity", 
+                       colors = c("dark blue", "light blue", "pink", "red")) +
+  theme_void() +
+  theme(legend.direction = "horizontal",
+        legend.position = "bottom")
+```
